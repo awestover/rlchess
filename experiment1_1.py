@@ -24,7 +24,10 @@ from safetytooling.data_models import ChatMessage, MessageRole, Prompt
 from safetytooling.utils import utils
 
 # OpenRouter configuration
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+INFERENCE_URL = "https://openrouter.ai/api/v1"
+# URL = "https://localhost:8000/v1"
+MODEL = "Qwen/Qwen3-8b"
+# MODEL = "Qwen/Qwen3-32b"
 
 # Sample chess positions (FEN strings) - a mix of opening, middlegame, and endgame
 SAMPLE_POSITIONS = [
@@ -106,14 +109,14 @@ def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | 
     box_pattern = r'\\box\{([a-h][1-8][a-h][1-8][qrbn]?)\}'
     matches = re.findall(box_pattern, text)
     if len(matches) == 1:
-        move = chess.Move.from_uci(match)
+        move = chess.Move.from_uci(matches[0])
         if move in board.legal_moves:
             return move
 
     return None
 
 
-async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = "Qwen/Qwen3-8b",) -> tuple[str, chess.Move | None]:
+async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL,) -> tuple[str, chess.Move | None]:
     """
     Ask Qwen for a chess move.
     Returns (response_text, parsed_move).
@@ -121,7 +124,7 @@ async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bo
     board_text = board.fen()
 
     if use_cot:
-        prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}"""
+        prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}. Note that you have a reasoning budget of only 1000 tokens, so don't think for too long."""
     else:
         prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}} /no_think"""
 
@@ -130,7 +133,7 @@ async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bo
     response = await api(
         model_id=model_id,
         prompt=prompt,
-        max_tokens=2000,  # Qwen3-8b is a reasoning model, needs tokens for thinking
+        max_tokens=1000,  # Reduced for faster responses
         temperature=0,
         force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
     )
@@ -141,11 +144,43 @@ async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bo
     return response_text, parsed_move
 
 
-def compute_and_plot_results(results: dict, output_path: str = "experiment1_1_results.png"):
-    """Compute statistics, print results, and create bar graph."""
-    # Calculate statistics
+def compute_and_plot_results(all_results: list, output_path: str = "experiment1_1_results.png"):
+    """Save outputs, compute statistics, print results, and create bar graph."""
+    # Save model outputs to folder
+    output_dir = Path("model_outputs_visual")
+    output_dir.mkdir(exist_ok=True)
+    for i, result in enumerate(all_results):
+        mode = result["mode"]
+        desc = result["description"].replace(" ", "_").replace(".", "")
+        filename = f"{i:02d}_{desc}_{mode}.txt"
+        with open(output_dir / filename, "w") as f:
+            f.write(f"Position: {result['description']}\n")
+            f.write(f"FEN: {result['position']}\n")
+            f.write(f"Mode: {mode}\n")
+            f.write(f"Valid move: {result['valid_move']}\n")
+            f.write("=" * 60 + "\n")
+            f.write("MODEL RESPONSE:\n")
+            f.write("=" * 60 + "\n")
+            f.write(result.get("response", "") + "\n")
+    print(f"Saved {len(all_results)} model outputs to {output_dir}/")
+
+    # Organize results by mode
+    results = {"with_cot": [], "without_cot": []}
+    for result in all_results:
+        mode = result["mode"]
+        result_copy = {k: v for k, v in result.items() if k not in ("mode", "response")}
+        results[mode].append(result_copy)
+
+        # Print progress
+        if result["valid_move"]:
+            print(f"  {result['description']} ({mode}): {result.get('move', 'N/A')} (loss: {result['centipawn_loss']})")
+        else:
+            print(f"  {result['description']} ({mode}): INVALID MOVE")
+
+    # Calculate statistics (only for modes that have results)
     stats = {}
-    for mode in ["with_cot", "without_cot"]:
+    active_modes = [m for m in ["with_cot", "without_cot"] if results[m]]
+    for mode in active_modes:
         cpl_values = [r["centipawn_loss"] for r in results[mode]]
         valid_moves = sum(1 for r in results[mode] if r["valid_move"])
         best_moves = sum(1 for r in results[mode] if r.get("is_best", False))
@@ -164,7 +199,7 @@ def compute_and_plot_results(results: dict, output_path: str = "experiment1_1_re
     print("RESULTS")
     print("=" * 60)
 
-    for mode in ["with_cot", "without_cot"]:
+    for mode in active_modes:
         s = stats[mode]
         print(f"\n{mode.upper().replace('_', ' ')}:")
         print(f"  Average centipawn loss: {s['avg_centipawn_loss']:.1f} (+/- {s['std_centipawn_loss']:.1f})")
@@ -172,49 +207,52 @@ def compute_and_plot_results(results: dict, output_path: str = "experiment1_1_re
         print(f"  Best move rate: {s['best_move_rate']*100:.1f}%")
         print(f"  Estimated ELO: ~{s['estimated_elo']}")
 
-    # Create bar graph
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    # Create bar graph (only if we have both modes for comparison)
+    if len(active_modes) == 2:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    modes = ["With CoT", "Without CoT"]
-    x = np.arange(len(modes))
+        modes = ["With CoT", "Without CoT"]
+        x = np.arange(len(modes))
 
-    # Centipawn loss
-    ax1 = axes[0]
-    cpl_values = [stats["with_cot"]["avg_centipawn_loss"], stats["without_cot"]["avg_centipawn_loss"]]
-    cpl_stds = [stats["with_cot"]["std_centipawn_loss"], stats["without_cot"]["std_centipawn_loss"]]
-    ax1.bar(x, cpl_values, yerr=cpl_stds, capsize=5, color=["#2ecc71", "#e74c3c"])
-    ax1.set_ylabel("Centipawn Loss")
-    ax1.set_title("Average Centipawn Loss\n(lower is better)")
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(modes)
-    ax1.axhline(y=50, color='gray', linestyle='--', alpha=0.5, label='~2000 ELO')
-    ax1.axhline(y=100, color='gray', linestyle=':', alpha=0.5, label='~1700 ELO')
-    ax1.legend()
+        # Centipawn loss
+        ax1 = axes[0]
+        cpl_values = [stats["with_cot"]["avg_centipawn_loss"], stats["without_cot"]["avg_centipawn_loss"]]
+        cpl_stds = [stats["with_cot"]["std_centipawn_loss"], stats["without_cot"]["std_centipawn_loss"]]
+        ax1.bar(x, cpl_values, yerr=cpl_stds, capsize=5, color=["#2ecc71", "#e74c3c"])
+        ax1.set_ylabel("Centipawn Loss")
+        ax1.set_title("Average Centipawn Loss\n(lower is better)")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(modes)
+        ax1.axhline(y=50, color='gray', linestyle='--', alpha=0.5, label='~2000 ELO')
+        ax1.axhline(y=100, color='gray', linestyle=':', alpha=0.5, label='~1700 ELO')
+        ax1.legend()
 
-    # Valid move rate
-    ax2 = axes[1]
-    valid_rates = [stats["with_cot"]["valid_move_rate"]*100, stats["without_cot"]["valid_move_rate"]*100]
-    ax2.bar(x, valid_rates, color=["#2ecc71", "#e74c3c"])
-    ax2.set_ylabel("Valid Move Rate (%)")
-    ax2.set_title("Valid Move Rate")
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(modes)
-    ax2.set_ylim(0, 105)
+        # Valid move rate
+        ax2 = axes[1]
+        valid_rates = [stats["with_cot"]["valid_move_rate"]*100, stats["without_cot"]["valid_move_rate"]*100]
+        ax2.bar(x, valid_rates, color=["#2ecc71", "#e74c3c"])
+        ax2.set_ylabel("Valid Move Rate (%)")
+        ax2.set_title("Valid Move Rate")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(modes)
+        ax2.set_ylim(0, 105)
 
-    # Best move rate
-    ax3 = axes[2]
-    best_rates = [stats["with_cot"]["best_move_rate"]*100, stats["without_cot"]["best_move_rate"]*100]
-    ax3.bar(x, best_rates, color=["#2ecc71", "#e74c3c"])
-    ax3.set_ylabel("Best Move Rate (%)")
-    ax3.set_title("Best Move Rate")
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(modes)
-    ax3.set_ylim(0, 105)
+        # Best move rate
+        ax3 = axes[2]
+        best_rates = [stats["with_cot"]["best_move_rate"]*100, stats["without_cot"]["best_move_rate"]*100]
+        ax3.bar(x, best_rates, color=["#2ecc71", "#e74c3c"])
+        ax3.set_ylabel("Best Move Rate (%)")
+        ax3.set_title("Best Move Rate")
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(modes)
+        ax3.set_ylim(0, 105)
 
-    plt.suptitle("Qwen3-8B Chess Performance: With vs Without Chain-of-Thought", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"\nPlot saved to {output_path}")
+        plt.suptitle("Qwen3-8B Chess Performance: With vs Without Chain-of-Thought", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"\nPlot saved to {output_path}")
+    else:
+        print("\nSkipping plot (need both CoT modes for comparison)")
 
     # Add ELO context
     print("\n" + "=" * 60)
@@ -237,7 +275,7 @@ def compute_and_plot_results(results: dict, output_path: str = "experiment1_1_re
         json.dump({"results": results, "stats": stats}, f, indent=2)
     print(f"Detailed results saved to experiment1_1_results.json")
 
-    return stats
+    return results, stats
 
 
 def centipawn_loss_to_elo_estimate(avg_cpl: float) -> int:
@@ -275,30 +313,38 @@ def centipawn_loss_to_elo_estimate(avg_cpl: float) -> int:
         return 1000
 
 
-async def evaluate_single_position( api: InferenceAPI, fen: str, description: str, use_cot: bool, engine: chess.engine.SimpleEngine,) -> dict:
-    """Evaluate a single position with the model."""
+async def get_model_move( api: InferenceAPI, fen: str, description: str, use_cot: bool,) -> dict:
+    """Get move from model (no Stockfish evaluation yet)."""
     board = chess.Board(fen)
     mode = "with_cot" if use_cot else "without_cot"
 
     response, move = await get_move_from_qwen(api, board, use_cot)
 
+    return {
+        "position": fen,
+        "description": description,
+        "mode": mode,
+        "move": move,
+        "response": response or "",
+    }
+
+
+def evaluate_with_stockfish(result: dict, engine: chess.engine.SimpleEngine) -> dict:
+    """Evaluate a model's move with Stockfish (synchronous)."""
+    board = chess.Board(result["position"])
+    move = result["move"]
+    
     if move is None:
         return {
-            "position": fen,
-            "description": description,
-            "mode": mode,
+            **result,
             "valid_move": False,
             "centipawn_loss": 500,  # Penalty for invalid move
-            "response": response or "",
         }
     else:
         eval_result = evaluate_move(board, move, engine)
         return {
-            "position": fen,
-            "description": description,
-            "mode": mode,
+            **result,
             "valid_move": True,
-            "response": response,
             **eval_result,
         }
 
@@ -310,12 +356,9 @@ async def run_experiment(test_mode: bool = False, concurrency: int = 100):
     # Use OpenRouter API
     api = InferenceAPI(
         cache_dir=Path(".cache"),
-        openai_base_url=OPENROUTER_BASE_URL,
+        openai_base_url=INFERENCE_URL,
         openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     )
-
-    # Initialize Stockfish
-    engine = chess.engine.SimpleEngine.popen_uci("stockfish")
 
     positions = SAMPLE_POSITIONS[:3] if test_mode else SAMPLE_POSITIONS
 
@@ -324,53 +367,32 @@ async def run_experiment(test_mode: bool = False, concurrency: int = 100):
 
     # Create task specifications
     task_specs = []
+    cot_modes = [False] if test_mode else [True, False]  # Skip CoT in test mode
     for fen, description in positions:
-        for use_cot in [True, False]:
+        for use_cot in cot_modes:
             task_specs.append((fen, description, use_cot))
 
+    semaphore = asyncio.Semaphore(concurrency)  # Shared semaphore for rate limiting
+
     async def limited_task(fen, description, use_cot):
-        async with asyncio.Semaphore(concurrency):
-            return await evaluate_single_position(api, fen, description, use_cot, engine)
+        async with semaphore:
+            return await get_model_move(api, fen, description, use_cot)
 
-    # Run all tasks concurrently with limited concurrency
+    # Run all API calls concurrently
     print(f"Launching {len(task_specs)} API calls...")
-    all_results = await asyncio.gather(*[limited_task(fen, desc, cot) for fen, desc, cot in task_specs])
+    model_results = await asyncio.gather(*[limited_task(fen, desc, cot) for fen, desc, cot in task_specs])
 
-    # Save model outputs to folder
-    output_dir = Path("model_outputs_visual")
-    output_dir.mkdir(exist_ok=True)
-    for i, result in enumerate(all_results):
-        mode = result["mode"]
-        desc = result["description"].replace(" ", "_").replace(".", "")
-        filename = f"{i:02d}_{desc}_{mode}.txt"
-        with open(output_dir / filename, "w") as f:
-            f.write(f"Position: {result['description']}\n")
-            f.write(f"FEN: {result['position']}\n")
-            f.write(f"Mode: {mode}\n")
-            f.write(f"Valid move: {result['valid_move']}\n")
-            f.write("=" * 60 + "\n")
-            f.write("MODEL RESPONSE:\n")
-            f.write("=" * 60 + "\n")
-            f.write(result.get("response", "") + "\n")
-    print(f"Saved {len(all_results)} model outputs to {output_dir}/")
-
-    # Organize results by mode
-    results = {"with_cot": [], "without_cot": []}
-    for result in all_results:
-        mode = result.pop("mode")
-        result.pop("response", None)  # Remove response from results dict
-        results[mode].append(result)
-
-        # Print progress
-        if result["valid_move"]:
-            print(f"  {result['description']} ({mode}): {result['move']} (loss: {result['centipawn_loss']})")
-        else:
-            print(f"  {result['description']} ({mode}): INVALID MOVE")
-
+    # Now evaluate with Stockfish sequentially (avoids crashes)
+    print("Evaluating moves with Stockfish...")
+    engine = chess.engine.SimpleEngine.popen_uci("stockfish")
+    all_results = []
+    for result in model_results:
+        evaluated = evaluate_with_stockfish(result, engine)
+        all_results.append(evaluated)
     engine.quit()
 
-    # Compute stats, plot, and save results
-    stats = compute_and_plot_results(results)
+    # Save outputs, compute stats, plot, and save results
+    results, stats = compute_and_plot_results(all_results)
 
     return results, stats
 
