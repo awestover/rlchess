@@ -25,7 +25,7 @@ from safetytooling.utils import utils
 
 # OpenRouter configuration
 INFERENCE_URL = "https://openrouter.ai/api/v1"
-# URL = "https://localhost:8000/v1"
+INFERENCE_URL = "https://localhost:8000/v1"
 MODEL = "Qwen/Qwen3-8b"
 # MODEL = "Qwen/Qwen3-32b"
 
@@ -133,7 +133,6 @@ async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bo
     response = await api(
         model_id=model_id,
         prompt=prompt,
-        max_tokens=1000,  # Reduced for faster responses
         temperature=0,
         force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
     )
