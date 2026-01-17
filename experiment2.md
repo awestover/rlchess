@@ -1,0 +1,1 @@
+We can probably do RL on Qwen using Tinker. Maybe that's a good idea.
