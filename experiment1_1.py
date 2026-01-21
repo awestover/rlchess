@@ -25,9 +25,10 @@ from safetytooling.apis import InferenceAPI
 from safetytooling.data_models import ChatMessage, MessageRole, Prompt
 from safetytooling.utils import utils
 
+from chess_utils import evaluate_with_stockfish
+
 # OpenRouter configuration
 INFERENCE_URL = "https://openrouter.ai/api/v1"
-# INFERENCE_URL = "https://localhost:8000/v1"
 MODEL = "openai/gpt-oss-20b"
 
 def load_positions(path: str = "outputs/boards.json") -> list[tuple[str, str]]:
@@ -35,43 +36,6 @@ def load_positions(path: str = "outputs/boards.json") -> list[tuple[str, str]]:
     with open(path) as f:
         fens = json.load(f)
     return [(fen, f"Position {i+1}") for i, fen in enumerate(fens)]
-
-def evaluate_move(board: chess.Board, move: chess.Move, engine: chess.engine.SimpleEngine) -> dict:
-    """
-    Evaluate a move using Stockfish.
-    Returns centipawn loss and other metrics.
-    """
-    # Get evaluation before the move
-    info_before = engine.analyse(board, chess.engine.Limit(depth=15))
-    score_before = info_before["score"].relative.score(mate_score=10000)
-
-    # Find best move
-    best_move_info = engine.play(board, chess.engine.Limit(depth=15))
-    best_move = best_move_info.move
-
-    # Make the actual move and evaluate
-    board_copy = board.copy()
-    board_copy.push(move)
-    info_after = engine.analyse(board_copy, chess.engine.Limit(depth=15))
-    # Note: score is now from opponent's perspective, so negate it
-    score_after = -info_after["score"].relative.score(mate_score=10000)
-
-    # Make the best move and evaluate
-    board_best = board.copy()
-    board_best.push(best_move)
-    info_best = engine.analyse(board_best, chess.engine.Limit(depth=15))
-    score_best = -info_best["score"].relative.score(mate_score=10000)
-
-    centipawn_loss = score_best - score_after
-
-    return {
-        "move": move.uci(),
-        "best_move": best_move.uci(),
-        "is_best": move == best_move,
-        "centipawn_loss": max(0, centipawn_loss),  # Loss should be non-negative
-        "score_after": score_after,
-        "score_best": score_best,
-    }
 
 
 def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | None:
@@ -102,12 +66,12 @@ async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bo
     prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
 
     # Use reasoning={"effort": "low"} to disable CoT for GPT models
-    extra_kwargs = {} if use_cot else {"extra_body": { "reasoning": {"effort": "low"}}}
+    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}} if use_cot else {"extra_body": { "reasoning": {"effort": "low"}}}
     
     response = await api(
         model_id=model_id,
         prompt=prompt,
-        temperature=0,
+        temperature=1,
         force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
         **extra_kwargs,
     )
@@ -149,6 +113,8 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
         cpl_values = [r["centipawn_loss"] for r in results[mode]]
         valid_moves = sum(1 for r in results[mode] if r["valid_move"])
         best_moves = sum(1 for r in results[mode] if r.get("is_best", False))
+        # Count reasoning tokens (approximate by splitting on whitespace)
+        reasoning_tokens = [len(r.get("reasoning", "").split()) for r in results[mode]]
 
         avg_cpl = np.mean(cpl_values)
         stats[mode] = {
@@ -157,6 +123,8 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
             "valid_move_rate": valid_moves / len(results[mode]),
             "best_move_rate": best_moves / len(results[mode]),
             "estimated_elo": centipawn_loss_to_elo_estimate(avg_cpl),
+            "avg_reasoning_tokens": np.mean(reasoning_tokens),
+            "std_reasoning_tokens": np.std(reasoning_tokens),
         }
 
     # Print results
@@ -172,10 +140,11 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
         print(f"  Valid move rate: {s['valid_move_rate']*100:.1f}%")
         print(f"  Best move rate: {s['best_move_rate']*100:.1f}%")
         print(f"  Estimated ELO: ~{s['estimated_elo']}")
+        print(f"  Avg reasoning words: {s['avg_reasoning_tokens']:.1f} (+/- {s['std_reasoning_tokens']:.1f})")
 
     # Create bar graph (only if we have both modes for comparison)
     if len(active_modes) == 2:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
         modes = ["High Reasoning", "Low Reasoning"]
         x = np.arange(len(modes))
@@ -202,6 +171,16 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
         ax2.set_xticks(x)
         ax2.set_xticklabels(modes)
         ax2.set_ylim(0, 105)
+
+        # Reasoning words
+        ax3 = axes[2]
+        token_values = [stats["with_cot"]["avg_reasoning_tokens"], stats["without_cot"]["avg_reasoning_tokens"]]
+        token_stds = [stats["with_cot"]["std_reasoning_tokens"], stats["without_cot"]["std_reasoning_tokens"]]
+        ax3.bar(x, token_values, yerr=token_stds, capsize=5, color=["#2ecc71", "#e74c3c"])
+        ax3.set_ylabel("Reasoning Words")
+        ax3.set_title("Average Reasoning Words")
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(modes)
 
         plt.suptitle("GPT-OSS-20B Chess Performance: High vs Low Reasoning", fontsize=14, fontweight='bold')
         plt.tight_layout()
@@ -312,28 +291,8 @@ async def get_model_move(api: InferenceAPI, fen: str, description: str, use_cot:
     return result
 
 
-def evaluate_with_stockfish(result: dict, engine: chess.engine.SimpleEngine) -> dict:
-    """Evaluate a model's move with Stockfish (synchronous)."""
-    board = chess.Board(result["position"])
-    move_str = result["move"]
-    
-    if move_str is None:
-        return {
-            **result,
-            "valid_move": False,
-            "centipawn_loss": 500,  # Penalty for invalid move
-        }
-    else:
-        move = chess.Move.from_uci(move_str)
-        eval_result = evaluate_move(board, move, engine)
-        return {
-            **result,
-            "valid_move": True,
-            **eval_result,
-        }
 
-
-async def run_experiment(test_mode: bool = False, concurrency: int = 50, num_positions: int = 500):
+async def run_experiment(test_mode: bool = False, concurrency: int = 100, num_positions: int = 500):
     """Run the experiment with concurrent API calls."""
     utils.setup_environment()
 
@@ -413,7 +372,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", action="store_true", help="Run in test mode (3 positions only)")
-    parser.add_argument("--n", type=int, default=500, help="Number of positions to evaluate")
+    parser.add_argument("--n", type=int, default=10, help="Number of positions to evaluate")
     args = parser.parse_args()
     
     if args.test:

@@ -17,7 +17,8 @@ async def main():
     response = await API(
         model_id=MODEL,
         prompt=prompt,
-        temperature=0,
+        temperature=1,
+        max_tokens=1000,
         force_provider="openai",
         extra_body={
             # "reasoning": {"effort": "low"}
