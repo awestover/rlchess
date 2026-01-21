@@ -56,22 +56,29 @@ def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | 
     return None
 
 
-async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL) -> tuple[str, chess.Move | None, str]:
+async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL, seed: int | None = None) -> tuple[str, chess.Move | None, str]:
     """
     Ask the model for a chess move.
     Returns (response_text, parsed_move, reasoning_trace).
+    
+    Args:
+        seed: Optional seed for reproducibility. Different seeds give different cached results.
     """
     board_text = board.fen()
     prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}"""
     prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
 
     # Use reasoning={"effort": "low"} to disable CoT for GPT models
-    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}} if use_cot else {"extra_body": { "reasoning": {"effort": "low"}}}
+    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}, "max_tokens": 2048} 
+    if not use_cot: 
+        extra_kwargs["extra_body"] = {"reasoning": {"effort": "low"}}
+        extra_kwargs["max_tokens"] = 128
     
     response = await api(
         model_id=model_id,
         prompt=prompt,
         temperature=1,
+        seed=seed,
         force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
         **extra_kwargs,
     )
@@ -108,13 +115,15 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
 
     # Calculate statistics (only for modes that have results)
     stats = {}
+    raw_reasoning_words = {}  # Store raw values for scatter plot
     active_modes = [m for m in ["with_cot", "without_cot"] if results[m]]
     for mode in active_modes:
         cpl_values = [r["centipawn_loss"] for r in results[mode]]
         valid_moves = sum(1 for r in results[mode] if r["valid_move"])
         best_moves = sum(1 for r in results[mode] if r.get("is_best", False))
-        # Count reasoning tokens (approximate by splitting on whitespace)
-        reasoning_tokens = [len(r.get("reasoning", "").split()) for r in results[mode]]
+        # Count reasoning words (approximate by splitting on whitespace)
+        reasoning_words = [len(r.get("reasoning", "").split()) for r in results[mode]]
+        raw_reasoning_words[mode] = reasoning_words
 
         avg_cpl = np.mean(cpl_values)
         stats[mode] = {
@@ -123,8 +132,8 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
             "valid_move_rate": valid_moves / len(results[mode]),
             "best_move_rate": best_moves / len(results[mode]),
             "estimated_elo": centipawn_loss_to_elo_estimate(avg_cpl),
-            "avg_reasoning_tokens": np.mean(reasoning_tokens),
-            "std_reasoning_tokens": np.std(reasoning_tokens),
+            "avg_reasoning_tokens": np.mean(reasoning_words),
+            "std_reasoning_tokens": np.std(reasoning_words),
         }
 
     # Print results
@@ -172,13 +181,24 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
         ax2.set_xticklabels(modes)
         ax2.set_ylim(0, 105)
 
-        # Reasoning words
+        # Reasoning words (log scale)
         ax3 = axes[2]
         token_values = [stats["with_cot"]["avg_reasoning_tokens"], stats["without_cot"]["avg_reasoning_tokens"]]
-        token_stds = [stats["with_cot"]["std_reasoning_tokens"], stats["without_cot"]["std_reasoning_tokens"]]
-        ax3.bar(x, token_values, yerr=token_stds, capsize=5, color=["#2ecc71", "#e74c3c"])
+        ax3.bar(x, token_values, color=["#2ecc71", "#e74c3c"], alpha=0.7)
+        # Add raw datapoints as scatter
+        for i, mode in enumerate(["with_cot", "without_cot"]):
+            jitter = np.random.uniform(-0.15, 0.15, len(raw_reasoning_words[mode]))
+            # Add 1 to avoid log(0) issues
+            values = [max(v, 1) for v in raw_reasoning_words[mode]]
+            ax3.scatter(x[i] + jitter, values, color="black", alpha=0.4, s=15, zorder=3)
+        ax3.set_yscale('log', base=2)
+        # Set tick marks at powers of 2
+        max_val = max(max(raw_reasoning_words["with_cot"]), max(raw_reasoning_words["without_cot"]), 1)
+        powers = [2**i for i in range(0, int(np.log2(max_val)) + 2)]
+        ax3.set_yticks(powers)
+        ax3.set_yticklabels([str(p) for p in powers])
         ax3.set_ylabel("Reasoning Words")
-        ax3.set_title("Average Reasoning Words")
+        ax3.set_title("Average Reasoning Words (log scale)")
         ax3.set_xticks(x)
         ax3.set_xticklabels(modes)
 
@@ -289,7 +309,6 @@ async def get_model_move(api: InferenceAPI, fen: str, description: str, use_cot:
     write_result_to_file(result, idx, output_dir)
     
     return result
-
 
 
 async def run_experiment(test_mode: bool = False, concurrency: int = 100, num_positions: int = 500):

@@ -23,6 +23,7 @@ async def main():
         extra_body={
             # "reasoning": {"effort": "low"}
         },
+        seed=42
     )
     print("Response:")
     print(response[0].completion)
