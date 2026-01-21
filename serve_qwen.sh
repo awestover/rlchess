@@ -1,1 +1,0 @@
-vllm serve Qwen/Qwen3-8B --port 8000

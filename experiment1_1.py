@@ -1,5 +1,5 @@
 """
-Experiment 1-1: Evaluate Qwen3-8B chess move quality on static positions.
+Experiment 1-1: Evaluate GPTOSS-20b chess move quality on static positions.
 
 This script:
 1. Loads chess positions from a dataset
@@ -25,18 +25,16 @@ from safetytooling.utils import utils
 
 # OpenRouter configuration
 INFERENCE_URL = "https://openrouter.ai/api/v1"
-INFERENCE_URL = "https://localhost:8000/v1"
-MODEL = "Qwen/Qwen3-8b"
-# MODEL = "Qwen/Qwen3-32b"
+# INFERENCE_URL = "https://localhost:8000/v1"
+MODEL = "openai/gpt-oss-20b"
 
-# Sample chess positions (FEN strings) - a mix of opening, middlegame, and endgame
 SAMPLE_POSITIONS = [
     # Opening positions
     ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1", "After 1.e4"),
     ("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2", "After 1.e4 e5"),
     ("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "Italian Game start"),
-    ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4", "Italian Game"),
-    ("rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/8/PPPP1PPP/RNBQK1NR w KQkq - 2 3", "Bishops Opening"),
+    ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 4", "Italian Game"),
+    ("rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/8/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "Bishops Opening"),
 
     # Middlegame positions
     ("r1bq1rk1/ppp2ppp/2n2n2/3pp3/1bPP4/2N1PN2/PP3PPP/R1BQKB1R w KQ d6 0 7", "Queens Gambit Declined"),
@@ -47,7 +45,7 @@ SAMPLE_POSITIONS = [
 
     # Tactical positions
     ("r2qkb1r/pp2pppp/2n2n2/3p4/3P2b1/2N2N2/PPP2PPP/R1BQKB1R w KQkq - 4 6", "Pin on f3"),
-    ("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQK2R w KQkq - 0 5", "Development position"),
+    ("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQKB1R w KQkq - 0 5", "Development position"),
     ("2r2rk1/pp2ppbp/1qnp1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 5 13", "Opposite castling"),
 
     # Endgame positions
@@ -270,9 +268,9 @@ def compute_and_plot_results(all_results: list, output_path: str = "experiment1_
     )
 
     # Save detailed results
-    with open("experiment1_1_results.json", "w") as f:
+    with open("outputs/experiment1_1_results.json", "w") as f:
         json.dump({"results": results, "stats": stats}, f, indent=2)
-    print(f"Detailed results saved to experiment1_1_results.json")
+    print(f"Detailed results saved to outputs/experiment1_1_results.json")
 
     return results, stats
 
