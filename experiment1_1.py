@@ -333,7 +333,7 @@ def evaluate_with_stockfish(result: dict, engine: chess.engine.SimpleEngine) -> 
         }
 
 
-async def run_experiment(test_mode: bool = False, concurrency: int = 50):
+async def run_experiment(test_mode: bool = False, concurrency: int = 50, num_positions: int = 500):
     """Run the experiment with concurrent API calls."""
     utils.setup_environment()
 
@@ -345,7 +345,10 @@ async def run_experiment(test_mode: bool = False, concurrency: int = 50):
     )
 
     all_positions = load_positions()
-    positions = all_positions[:3] if test_mode else all_positions
+    if test_mode:
+        positions = all_positions[:3]
+    else:
+        positions = all_positions[:num_positions]
 
     print(f"Running experiment on {len(positions)} positions with concurrency={concurrency}...")
     print("=" * 60)
@@ -407,8 +410,12 @@ async def run_experiment(test_mode: bool = False, concurrency: int = 50):
 
 
 if __name__ == "__main__":
-    import sys
-    test_mode = "--test" in sys.argv
-    if test_mode:
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true", help="Run in test mode (3 positions only)")
+    parser.add_argument("--n", type=int, default=500, help="Number of positions to evaluate")
+    args = parser.parse_args()
+    
+    if args.test:
         print("Running in TEST MODE (3 positions only)")
-    asyncio.run(run_experiment(test_mode=test_mode))
+    asyncio.run(run_experiment(test_mode=args.test, num_positions=args.n))
