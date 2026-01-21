@@ -18,6 +18,8 @@ import chess
 import chess.engine
 import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as tqdm_asyncio
 
 from safetytooling.apis import InferenceAPI
 from safetytooling.data_models import ChatMessage, MessageRole, Prompt
@@ -28,35 +30,11 @@ INFERENCE_URL = "https://openrouter.ai/api/v1"
 # INFERENCE_URL = "https://localhost:8000/v1"
 MODEL = "openai/gpt-oss-20b"
 
-SAMPLE_POSITIONS = [
-    # Opening positions
-    ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1", "After 1.e4"),
-    ("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2", "After 1.e4 e5"),
-    ("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "Italian Game start"),
-    ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 4 4", "Italian Game"),
-    ("rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/8/PPPP1PPP/RNBQKB1R w KQkq - 2 3", "Bishops Opening"),
-
-    # Middlegame positions
-    ("r1bq1rk1/ppp2ppp/2n2n2/3pp3/1bPP4/2N1PN2/PP3PPP/R1BQKB1R w KQ d6 0 7", "Queens Gambit Declined"),
-    ("r2q1rk1/pppbbppp/2n1pn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQ1RK1 w - - 6 8", "Closed position"),
-    ("r1b2rk1/pp1nqppp/2pbpn2/3p4/2PP4/2N1PN2/PPQ2PPP/R1B1KB1R w KQ - 4 9", "Typical middlegame"),
-    ("r4rk1/pp1bppbp/2np1np1/q7/3NP3/2N1BP2/PPPQ2PP/R3KB1R w KQ - 3 11", "Dragon Sicilian"),
-    ("r1bqr1k1/ppp2ppp/2np1n2/2b1p3/2B1P3/2PP1N2/PP3PPP/RNBQ1RK1 w - - 0 8", "Giuoco Piano"),
-
-    # Tactical positions
-    ("r2qkb1r/pp2pppp/2n2n2/3p4/3P2b1/2N2N2/PPP2PPP/R1BQKB1R w KQkq - 4 6", "Pin on f3"),
-    ("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/3P1N2/PPP2PPP/RNBQKB1R w KQkq - 0 5", "Development position"),
-    ("2r2rk1/pp2ppbp/1qnp1np1/8/3NP3/1BN1BP2/PPPQ2PP/2KR3R w - - 5 13", "Opposite castling"),
-
-    # Endgame positions
-    ("8/5k2/8/8/8/8/5PP1/4K3 w - - 0 1", "King and pawns endgame"),
-    ("8/8/8/3k4/8/8/3K4/3R4 w - - 0 1", "Rook vs King"),
-    ("8/8/4k3/8/2B5/8/8/4K3 w - - 0 1", "Bishop vs King"),
-    ("5k2/5p2/5P2/5K2/8/8/8/8 w - - 0 1", "Pawn endgame"),
-    ("8/8/8/8/8/5K2/4Q3/5k2 w - - 0 1", "Queen vs King"),
-    ("6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - 0 1", "Rook endgame"),
-    ("8/8/4k3/8/8/4K3/4P3/8 w - - 0 1", "Opposition endgame"),
-]
+def load_positions(path: str = "outputs/boards.json") -> list[tuple[str, str]]:
+    """Load positions from boards.json file (list of FEN strings)."""
+    with open(path) as f:
+        fens = json.load(f)
+    return [(fen, f"Position {i+1}") for i, fen in enumerate(fens)]
 
 def evaluate_move(board: chess.Board, move: chess.Move, engine: chess.engine.SimpleEngine) -> dict:
     """
@@ -114,10 +92,10 @@ def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | 
     return None
 
 
-async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL) -> tuple[str, chess.Move | None]:
+async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL) -> tuple[str, chess.Move | None, str]:
     """
     Ask the model for a chess move.
-    Returns (response_text, parsed_move).
+    Returns (response_text, parsed_move, reasoning_trace).
     """
     board_text = board.fen()
     prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}"""
@@ -136,29 +114,20 @@ async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bo
 
     response_text = response[0].completion
     parsed_move = parse_move_from_response(response_text, board)
+    
+    # Extract reasoning trace
+    reasoning = ""
+    try:
+        reasoning = response[0].generated_content[0].content['message'].get('reasoning', '')
+    except (IndexError, KeyError, TypeError):
+        pass
 
-    return response_text, parsed_move
+    return response_text, parsed_move, reasoning
 
 
-def compute_and_plot_results(all_results: list, output_path: str = "experiment1_1_results.png"):
-    """Save outputs, compute statistics, print results, and create bar graph."""
-    # Save model outputs to folder
-    output_dir = Path("model_outputs_visual")
-    output_dir.mkdir(exist_ok=True)
-    for i, result in enumerate(all_results):
-        mode = result["mode"]
-        desc = result["description"].replace(" ", "_").replace(".", "")
-        filename = f"{i:02d}_{desc}_{mode}.txt"
-        with open(output_dir / filename, "w") as f:
-            f.write(f"Position: {result['description']}\n")
-            f.write(f"FEN: {result['position']}\n")
-            f.write(f"Mode: {mode}\n")
-            f.write(f"Valid move: {result['valid_move']}\n")
-            f.write("=" * 60 + "\n")
-            f.write("MODEL RESPONSE:\n")
-            f.write("=" * 60 + "\n")
-            f.write(result.get("response", "") + "\n")
-    print(f"Saved {len(all_results)} model outputs to {output_dir}/")
+def compute_and_plot_results(all_results: list, output_path: str = "outputs/experiment1_1_results.png"):
+    """Compute statistics, print results, and create bar graph."""
+    print(f"Saved {len(all_results)} model outputs to model_outputs_visual/")
 
     # Organize results by mode
     results = {"with_cot": [], "without_cot": []}
@@ -195,9 +164,10 @@ def compute_and_plot_results(all_results: list, output_path: str = "experiment1_
     print("RESULTS")
     print("=" * 60)
 
+    mode_labels = {"with_cot": "HIGH REASONING", "without_cot": "LOW REASONING"}
     for mode in active_modes:
         s = stats[mode]
-        print(f"\n{mode.upper().replace('_', ' ')}:")
+        print(f"\n{mode_labels.get(mode, mode)}:")
         print(f"  Average centipawn loss: {s['avg_centipawn_loss']:.1f} (+/- {s['std_centipawn_loss']:.1f})")
         print(f"  Valid move rate: {s['valid_move_rate']*100:.1f}%")
         print(f"  Best move rate: {s['best_move_rate']*100:.1f}%")
@@ -205,9 +175,9 @@ def compute_and_plot_results(all_results: list, output_path: str = "experiment1_
 
     # Create bar graph (only if we have both modes for comparison)
     if len(active_modes) == 2:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
 
-        modes = ["With CoT", "Without CoT"]
+        modes = ["High Reasoning", "Low Reasoning"]
         x = np.arange(len(modes))
 
         # Centipawn loss
@@ -233,17 +203,7 @@ def compute_and_plot_results(all_results: list, output_path: str = "experiment1_
         ax2.set_xticklabels(modes)
         ax2.set_ylim(0, 105)
 
-        # Best move rate
-        ax3 = axes[2]
-        best_rates = [stats["with_cot"]["best_move_rate"]*100, stats["without_cot"]["best_move_rate"]*100]
-        ax3.bar(x, best_rates, color=["#2ecc71", "#e74c3c"])
-        ax3.set_ylabel("Best Move Rate (%)")
-        ax3.set_title("Best Move Rate")
-        ax3.set_xticks(x)
-        ax3.set_xticklabels(modes)
-        ax3.set_ylim(0, 105)
-
-        plt.suptitle("GPT-OSS-20B Chess Performance: With vs Without Chain-of-Thought", fontsize=14, fontweight='bold')
+        plt.suptitle("GPT-OSS-20B Chess Performance: High vs Low Reasoning", fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to {output_path}")
@@ -309,34 +269,62 @@ def centipawn_loss_to_elo_estimate(avg_cpl: float) -> int:
         return 1000
 
 
-async def get_model_move( api: InferenceAPI, fen: str, description: str, use_cot: bool,) -> dict:
+def write_result_to_file(result: dict, idx: int, output_dir: Path):
+    """Write a single result to model_outputs_visual folder."""
+    mode = result["mode"]
+    desc = result["description"].replace(" ", "_").replace(".", "")
+    filename = f"{idx:02d}_{desc}_{mode}.txt"
+    with open(output_dir / filename, "w") as f:
+        f.write(f"Position: {result['description']}\n")
+        f.write(f"FEN: {result['position']}\n")
+        f.write(f"Mode: {mode}\n")
+        f.write(f"Valid move: {result.get('valid_move', 'pending')}\n")
+        f.write("=" * 60 + "\n")
+        f.write("REASONING TRACE:\n")
+        f.write("=" * 60 + "\n")
+        f.write(result.get("reasoning", "") + "\n")
+        f.write("=" * 60 + "\n")
+        f.write("MODEL RESPONSE:\n")
+        f.write("=" * 60 + "\n")
+        f.write(result.get("response", "") + "\n")
+
+
+async def get_model_move(api: InferenceAPI, fen: str, description: str, use_cot: bool, idx: int, output_dir: Path) -> dict:
     """Get move from model (no Stockfish evaluation yet)."""
     board = chess.Board(fen)
     mode = "with_cot" if use_cot else "without_cot"
 
-    response, move = await get_move_from_model(api, board, use_cot)
+    response, move, reasoning = await get_move_from_model(api, board, use_cot)
 
-    return {
+    result = {
         "position": fen,
         "description": description,
         "mode": mode,
-        "move": move,
+        "move": move.uci() if move else None,
         "response": response or "",
+        "reasoning": reasoning or "",
+        "idx": idx,
     }
+    
+    # Write result immediately
+    write_result_to_file(result, idx, output_dir)
+    
+    return result
 
 
 def evaluate_with_stockfish(result: dict, engine: chess.engine.SimpleEngine) -> dict:
     """Evaluate a model's move with Stockfish (synchronous)."""
     board = chess.Board(result["position"])
-    move = result["move"]
+    move_str = result["move"]
     
-    if move is None:
+    if move_str is None:
         return {
             **result,
             "valid_move": False,
             "centipawn_loss": 500,  # Penalty for invalid move
         }
     else:
+        move = chess.Move.from_uci(move_str)
         eval_result = evaluate_move(board, move, engine)
         return {
             **result,
@@ -356,38 +344,63 @@ async def run_experiment(test_mode: bool = False, concurrency: int = 50):
         openai_api_key=os.getenv("OPENROUTER_API_KEY"),
     )
 
-    positions = SAMPLE_POSITIONS[:3] if test_mode else SAMPLE_POSITIONS
+    all_positions = load_positions()
+    positions = all_positions[:3] if test_mode else all_positions
 
     print(f"Running experiment on {len(positions)} positions with concurrency={concurrency}...")
     print("=" * 60)
 
-    # Create task specifications
+    # Create output directory
+    output_dir = Path("model_outputs_visual")
+    output_dir.mkdir(exist_ok=True)
+
+    # Create task specifications with indices
     task_specs = []
     cot_modes = [False] if test_mode else [True, False]  # Skip CoT in test mode
+    idx = 0
     for fen, description in positions:
         for use_cot in cot_modes:
-            task_specs.append((fen, description, use_cot))
+            task_specs.append((fen, description, use_cot, idx))
+            idx += 1
 
     semaphore = asyncio.Semaphore(concurrency)  # Shared semaphore for rate limiting
 
-    async def limited_task(fen, description, use_cot):
+    async def limited_task(fen, description, use_cot, idx):
         async with semaphore:
-            return await get_model_move(api, fen, description, use_cot)
+            return await get_model_move(api, fen, description, use_cot, idx, output_dir)
 
-    # Run all API calls concurrently
+    # Run all API calls concurrently with progress bar
     print(f"Launching {len(task_specs)} API calls...")
-    model_results = await asyncio.gather(*[limited_task(fen, desc, cot) for fen, desc, cot in task_specs])
+    tasks = [limited_task(fen, desc, cot, i) for fen, desc, cot, i in task_specs]
+    model_results = await tqdm_asyncio.gather(*tasks, desc="API calls")
 
     # Now evaluate with Stockfish sequentially (avoids crashes)
     print("Evaluating moves with Stockfish...")
     engine = chess.engine.SimpleEngine.popen_uci("stockfish")
     all_results = []
-    for result in model_results:
-        evaluated = evaluate_with_stockfish(result, engine)
+    for result in tqdm(model_results, desc="Stockfish eval"):
+        try:
+            evaluated = evaluate_with_stockfish(result, engine)
+        except chess.engine.EngineTerminatedError:
+            # Engine crashed, restart it and mark this result as failed
+            print(f"\nStockfish crashed on {result['description']}, restarting...")
+            try:
+                engine.quit()
+            except:
+                pass
+            engine = chess.engine.SimpleEngine.popen_uci("stockfish")
+            evaluated = {
+                **result,
+                "valid_move": False,
+                "centipawn_loss": 500,  # Penalty
+                "error": "stockfish_crash",
+            }
+        # Update the file with valid_move info after Stockfish evaluation
+        write_result_to_file(evaluated, evaluated["idx"], output_dir)
         all_results.append(evaluated)
     engine.quit()
 
-    # Save outputs, compute stats, plot, and save results
+    # Compute stats, plot, and save results
     results, stats = compute_and_plot_results(all_results)
 
     return results, stats

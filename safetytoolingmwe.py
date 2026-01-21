@@ -20,12 +20,12 @@ async def main():
         temperature=0,
         force_provider="openai",
         extra_body={
-            "reasoning": {"effort": "low"}
+            # "reasoning": {"effort": "low"}
         },
     )
     print("Response:")
     print(response[0].completion)
-
+    print(response[0].generated_content[0].content['message'].get('reasoning', []))
 
 if __name__ == "__main__":
     asyncio.run(main())
