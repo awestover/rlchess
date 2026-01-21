@@ -69,10 +69,11 @@ async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bo
     prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
 
     # Use reasoning={"effort": "low"} to disable CoT for GPT models
-    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}, "max_tokens": 2048} 
+    # Note: For OpenAI reasoning models, use max_completion_tokens instead of max_tokens
+    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}, "max_completion_tokens": 2048} 
     if not use_cot: 
         extra_kwargs["extra_body"] = {"reasoning": {"effort": "low"}}
-        extra_kwargs["max_tokens"] = 128
+        extra_kwargs["max_completion_tokens"] = 128
     
     response = await api(
         model_id=model_id,
