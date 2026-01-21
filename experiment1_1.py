@@ -345,7 +345,7 @@ def evaluate_with_stockfish(result: dict, engine: chess.engine.SimpleEngine) -> 
         }
 
 
-async def run_experiment(test_mode: bool = False, concurrency: int = 100):
+async def run_experiment(test_mode: bool = False, concurrency: int = 50):
     """Run the experiment with concurrent API calls."""
     utils.setup_environment()
 
