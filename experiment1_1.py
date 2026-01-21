@@ -3,7 +3,7 @@ Experiment 1-1: Evaluate GPTOSS-20b chess move quality on static positions.
 
 This script:
 1. Loads chess positions from a dataset
-2. Has Qwen suggest moves with and without chain-of-thought
+2. Has GPTOSS-20b suggest moves with and without chain-of-thought
 3. Evaluates move quality using Stockfish
 4. Outputs results as a bar graph with ELO context
 """
@@ -114,25 +114,24 @@ def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | 
     return None
 
 
-async def get_move_from_qwen( api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL,) -> tuple[str, chess.Move | None]:
+async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL) -> tuple[str, chess.Move | None]:
     """
-    Ask Qwen for a chess move.
+    Ask the model for a chess move.
     Returns (response_text, parsed_move).
     """
     board_text = board.fen()
-
-    if use_cot:
-        prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}. Note that you have a reasoning budget of only 1000 tokens, so don't think for too long."""
-    else:
-        prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}} /no_think"""
-
+    prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}"""
     prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
 
+    # Use reasoning={"effort": "low"} to disable CoT for GPT models
+    extra_kwargs = {} if use_cot else {"extra_body": { "reasoning": {"effort": "low"}}}
+    
     response = await api(
         model_id=model_id,
         prompt=prompt,
         temperature=0,
         force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
+        **extra_kwargs,
     )
 
     response_text = response[0].completion
@@ -244,7 +243,7 @@ def compute_and_plot_results(all_results: list, output_path: str = "experiment1_
         ax3.set_xticklabels(modes)
         ax3.set_ylim(0, 105)
 
-        plt.suptitle("Qwen3-8B Chess Performance: With vs Without Chain-of-Thought", fontsize=14, fontweight='bold')
+        plt.suptitle("GPT-OSS-20B Chess Performance: With vs Without Chain-of-Thought", fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to {output_path}")
@@ -315,7 +314,7 @@ async def get_model_move( api: InferenceAPI, fen: str, description: str, use_cot
     board = chess.Board(fen)
     mode = "with_cot" if use_cot else "without_cot"
 
-    response, move = await get_move_from_qwen(api, board, use_cot)
+    response, move = await get_move_from_model(api, board, use_cot)
 
     return {
         "position": fen,

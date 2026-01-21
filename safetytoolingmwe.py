@@ -19,6 +19,9 @@ async def main():
         prompt=prompt,
         temperature=0,
         force_provider="openai",
+        extra_body={
+            "reasoning": {"effort": "low"}
+        },
     )
     print("Response:")
     print(response[0].completion)
