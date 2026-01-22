@@ -19,7 +19,6 @@ from utils import (
     get_move_from_model,
     centipawn_loss_to_elo_estimate,
     evaluate_with_stockfish,
-    MODEL,
     INFERENCE_URL,
 )
 

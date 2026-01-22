@@ -12,6 +12,7 @@ from safetytooling.data_models import ChatMessage, MessageRole, Prompt
 # OpenRouter configuration
 INFERENCE_URL = "https://openrouter.ai/api/v1"
 MODEL = "openai/gpt-oss-20b"
+MODEL = "Qwen/Qwen3-30B-A3B"
 
 
 def load_positions(path: str = "outputs/boards.json") -> list[tuple[str, str]]:
@@ -49,7 +50,7 @@ async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bo
     """
     board_text = board.fen()
     prompt_text = f"""Here is a chess board:\n {board_text}
-    Please quickly output a good move (and nothing else). 
+    Please quickly [ie /nothink] output a good move (and nothing else). 
     If your move is e2e4 you write [move: e2e4]."""
     prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
 
