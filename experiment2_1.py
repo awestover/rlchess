@@ -1,30 +1,8 @@
-"""
-This script is exactly the same as experiment1_1.py (so maybe it should import functions from there)
-but with one difference:
-
-We do BoN on each chess board.
-You need to pass enable_cache False to the inference thing bc we are doing BoN.
-
-The "reward" that we are besting over is the centipawn loss of the best move as computed in chess_utils.py
-
-
-You will make the following plot:
-
-
-Line for amount of BoN ing.
-    We try: 2, 4, 8, 16.
-
-We have a line for each amount of reasoning.
-
-Plot is "N (in the BoN) vs CPL"
-
-For testing purposes just do low reasoning effort and only on a small number of boards.
-"""
-
 import asyncio
 import json
 import os
 from pathlib import Path
+from collections import defaultdict
 
 import chess
 import chess.engine
@@ -34,29 +12,16 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as tqdm_asyncio
 
 from safetytooling.apis import InferenceAPI
-from safetytooling.utils import utils
+from safetytooling.utils import utils as st_utils
 
-from experiment1_1 import (
+from utils import (
     load_positions,
     get_move_from_model,
     centipawn_loss_to_elo_estimate,
+    evaluate_with_stockfish,
     MODEL,
     INFERENCE_URL,
 )
-from chess_utils import evaluate_with_stockfish
-
-
-async def get_n_moves_from_model(
-    api: InferenceAPI, board: chess.Board, use_cot: bool, n: int
-) -> list[tuple[str, chess.Move | None, str]]:
-    """
-    Get N moves from the model for the same position.
-    Uses different seeds (1...N) so each sample is different but cacheable.
-    Returns list of (response_text, parsed_move, reasoning_trace).
-    """
-    tasks = [get_move_from_model(api, board, use_cot, seed=i+1) for i in range(n)]
-    results = await asyncio.gather(*tasks)
-    return results
 
 
 def select_best_move(
@@ -94,7 +59,7 @@ def select_best_move(
 
 async def run_bon_experiment(
     test_mode: bool = False,
-    concurrency: int = 50,
+    concurrency: int = 200,
     num_positions: int = 100,
 ):
     """
@@ -102,7 +67,7 @@ async def run_bon_experiment(
 
     For each position and each reasoning mode, sample N times and pick the best.
     """
-    utils.setup_environment()
+    st_utils.setup_environment()
 
     # Use OpenRouter API (caching works with different seeds for BoN)
     api = InferenceAPI(
@@ -120,43 +85,76 @@ async def run_bon_experiment(
     else:
         positions = all_positions[:num_positions]
         n_values = [1, 2, 4, 8, 16]
-        cot_modes = [True, False]  # Both high and low reasoning
+        cot_modes = [False]  # Only low reasoning
 
     print(f"Running BoN experiment on {len(positions)} positions")
     print(f"N values: {n_values}")
-    print(f"Reasoning modes: {'high and low' if len(cot_modes) == 2 else 'low only'}")
+    print(f"Reasoning modes: low only")
     print("=" * 60)
+
+    # Build all task specifications upfront
+    # Each task: (pos_idx, fen, n, use_cot, seed)
+    # We need separate API calls for each (position, n, cot, seed) combination
+    task_specs = []
+    for pos_idx, (fen, description) in enumerate(positions):
+        for n in n_values:
+            for use_cot in cot_modes:
+                for seed in range(1, n + 1):
+                    task_specs.append((pos_idx, fen, n, use_cot, seed))
+
+    print(f"Launching {len(task_specs)} API calls with concurrency={concurrency}...")
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def get_single_move(pos_idx, fen, n, use_cot, seed):
+        """Get a single move from the model."""
+        async with semaphore:
+            board = chess.Board(fen)
+            response, move, reasoning = await get_move_from_model(api, board, use_cot, seed=seed)
+            return {
+                "pos_idx": pos_idx,
+                "fen": fen,
+                "n": n,
+                "use_cot": use_cot,
+                "seed": seed,
+                "response": response,
+                "move": move,
+                "reasoning": reasoning,
+            }
+
+    # Run all API calls concurrently
+    tasks = [get_single_move(*spec) for spec in task_specs]
+    api_results = await tqdm_asyncio.gather(*tasks, desc="API calls")
+
+    # Group results by (pos_idx, n, use_cot)
+    grouped = defaultdict(list)
+    for r in api_results:
+        key = (r["pos_idx"], r["n"], r["use_cot"])
+        grouped[key].append(r)
+
+    # Now evaluate with Stockfish sequentially
+    print("Evaluating with Stockfish...")
+    engine = chess.engine.SimpleEngine.popen_uci("stockfish")
 
     # Results structure: {(n, use_cot): [list of CPL values]}
     results = {(n, cot): [] for n in n_values for cot in cot_modes}
 
-    # Start Stockfish engine
-    engine = chess.engine.SimpleEngine.popen_uci("stockfish")
-
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def get_moves_limited(board, use_cot, n):
-        async with semaphore:
-            return await get_n_moves_from_model(api, board, use_cot, n)
-
-    # Process each position
-    for pos_idx, (fen, description) in enumerate(tqdm(positions, desc="Positions")):
+    # Process each group
+    for (pos_idx, n, use_cot), moves_data in tqdm(sorted(grouped.items()), desc="Stockfish eval"):
+        fen = moves_data[0]["fen"]
         board = chess.Board(fen)
 
-        # For each N value and reasoning mode
-        for n in n_values:
-            for use_cot in cot_modes:
-                # Get N moves concurrently
-                moves = await get_moves_limited(board, use_cot, n)
+        # Convert to format expected by select_best_move
+        moves = [(m["response"], m["move"], m["reasoning"]) for m in moves_data]
 
-                # Select best move using Stockfish
-                best_idx, best_eval = select_best_move(moves, engine, board)
+        # Select best move using Stockfish
+        best_idx, best_eval = select_best_move(moves, engine, board)
 
-                cpl = best_eval["centipawn_loss"]
-                results[(n, use_cot)].append(cpl)
+        cpl = best_eval["centipawn_loss"]
+        results[(n, use_cot)].append(cpl)
 
-                mode_str = "high" if use_cot else "low"
-                print(f"  Pos {pos_idx+1}, N={n}, {mode_str}: CPL={cpl:.0f} (best of {n})")
+        mode_str = "medium" if use_cot else "low"
+        print(f"  Pos {pos_idx+1}, N={n}, {mode_str}: CPL={cpl:.0f} (best of {n})")
 
     engine.quit()
 
@@ -189,7 +187,7 @@ def compute_and_plot_bon_results(
     print("=" * 60)
 
     for cot in cot_modes:
-        mode_str = "HIGH REASONING" if cot else "LOW REASONING"
+        mode_str = "MEDIUM REASONING" if cot else "LOW REASONING"
         print(f"\n{mode_str}:")
         for n in n_values:
             s = stats[(n, cot)]
@@ -198,12 +196,12 @@ def compute_and_plot_bon_results(
     # Create plot
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    colors = {"high": "#2ecc71", "low": "#e74c3c"}
-    markers = {"high": "o", "low": "s"}
+    colors = {"medium": "#2ecc71", "low": "#e74c3c"}
+    markers = {"medium": "o", "low": "s"}
 
     for cot in cot_modes:
-        mode_str = "high" if cot else "low"
-        label = "High Reasoning" if cot else "Low Reasoning"
+        mode_str = "medium" if cot else "low"
+        label = "Medium Reasoning" if cot else "Low Reasoning"
 
         means = [stats[(n, cot)]["mean_cpl"] for n in n_values]
         stds = [stats[(n, cot)]["std_cpl"] for n in n_values]

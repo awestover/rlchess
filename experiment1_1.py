@@ -11,7 +11,6 @@ This script:
 import asyncio
 import json
 import os
-import re
 from pathlib import Path
 
 import chess
@@ -22,78 +21,16 @@ from tqdm import tqdm
 from tqdm.asyncio import tqdm as tqdm_asyncio
 
 from safetytooling.apis import InferenceAPI
-from safetytooling.data_models import ChatMessage, MessageRole, Prompt
-from safetytooling.utils import utils
+from safetytooling.utils import utils as st_utils
 
-from chess_utils import evaluate_with_stockfish
-
-# OpenRouter configuration
-INFERENCE_URL = "https://openrouter.ai/api/v1"
-MODEL = "openai/gpt-oss-20b"
-
-def load_positions(path: str = "outputs/boards.json") -> list[tuple[str, str]]:
-    """Load positions from boards.json file (list of FEN strings)."""
-    with open(path) as f:
-        fens = json.load(f)
-    return [(fen, f"Position {i+1}") for i, fen in enumerate(fens)]
-
-
-def parse_move_from_response(response: str, board: chess.Board) -> chess.Move | None:
-    """
-    Extract a chess move from the model's response.
-    Expects format: \\box{e2e4}
-    """
-    text = response.strip().lower()
-
-    # Look for \box{...} format
-    box_pattern = r'\\box\{([a-h][1-8][a-h][1-8][qrbn]?)\}'
-    matches = re.findall(box_pattern, text)
-    if len(matches) == 1:
-        move = chess.Move.from_uci(matches[0])
-        if move in board.legal_moves:
-            return move
-
-    return None
-
-
-async def get_move_from_model(api: InferenceAPI, board: chess.Board, use_cot: bool, model_id: str = MODEL, seed: int | None = None) -> tuple[str, chess.Move | None, str]:
-    """
-    Ask the model for a chess move.
-    Returns (response_text, parsed_move, reasoning_trace).
-    
-    Args:
-        seed: Optional seed for reproducibility. Different seeds give different cached results.
-    """
-    board_text = board.fen()
-    prompt_text = f"""{board_text}\n\n What is your move? Output your move like this: \\box{{e2e4}}"""
-    prompt = Prompt(messages=[ChatMessage(content=prompt_text, role=MessageRole.user)])
-
-    # Use reasoning={"effort": "low"} to disable CoT for GPT models
-    # Note: For OpenAI reasoning models, use max_completion_tokens instead of max_tokens
-    extra_kwargs = {"extra_body": { "reasoning": {"effort": "high"}}} 
-    if not use_cot: 
-        extra_kwargs["extra_body"] = {"reasoning": {"effort": "low"}}
-
-    response = await api(
-        model_id=model_id,
-        prompt=prompt,
-        temperature=1,
-        seed=seed,
-        force_provider="openai",  # Use OpenRouter via OpenAI-compatible API
-        **extra_kwargs,
-    )
-
-    response_text = response[0].completion
-    parsed_move = parse_move_from_response(response_text, board)
-    
-    # Extract reasoning trace
-    reasoning = ""
-    try:
-        reasoning = response[0].generated_content[0].content['message'].get('reasoning', '')
-    except (IndexError, KeyError, TypeError):
-        pass
-
-    return response_text, parsed_move, reasoning
+from utils import (
+    load_positions,
+    get_move_from_model,
+    centipawn_loss_to_elo_estimate,
+    evaluate_with_stockfish,
+    MODEL,
+    INFERENCE_URL,
+)
 
 
 def compute_and_plot_results(all_results: list, output_path: str = "outputs/experiment1_1_results.png"):
@@ -141,7 +78,7 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
     print("RESULTS")
     print("=" * 60)
 
-    mode_labels = {"with_cot": "HIGH REASONING", "without_cot": "LOW REASONING"}
+    mode_labels = {"with_cot": "MEDIUM REASONING", "without_cot": "LOW REASONING"}
     for mode in active_modes:
         s = stats[mode]
         print(f"\n{mode_labels.get(mode, mode)}:")
@@ -155,7 +92,7 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
     if len(active_modes) == 2:
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        modes = ["High Reasoning", "Low Reasoning"]
+        modes = ["Medium Reasoning", "Low Reasoning"]
         x = np.arange(len(modes))
 
         # Centipawn loss
@@ -202,7 +139,7 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
         ax3.set_xticks(x)
         ax3.set_xticklabels(modes)
 
-        plt.suptitle("GPT-OSS-20B Chess Performance: High vs Low Reasoning", fontsize=14, fontweight='bold')
+        plt.suptitle("GPT-OSS-20B Chess Performance: Medium vs Low Reasoning", fontsize=14, fontweight='bold')
         plt.tight_layout()
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"\nPlot saved to {output_path}")
@@ -231,41 +168,6 @@ def compute_and_plot_results(all_results: list, output_path: str = "outputs/expe
     print(f"Detailed results saved to outputs/experiment1_1_results.json")
 
     return results, stats
-
-
-def centipawn_loss_to_elo_estimate(avg_cpl: float) -> int:
-    """
-    Rough estimate of ELO based on average centipawn loss.
-    Based on empirical data from chess databases.
-    """
-    # Approximate mapping (varies by source):
-    # Grandmaster (2500+): 10-20 CPL
-    # Master (2200-2500): 20-40 CPL
-    # Expert (2000-2200): 40-60 CPL
-    # Class A (1800-2000): 60-90 CPL
-    # Class B (1600-1800): 90-120 CPL
-    # Class C (1400-1600): 120-160 CPL
-    # Class D (1200-1400): 160-200 CPL
-    # Beginner (<1200): 200+ CPL
-
-    if avg_cpl < 15:
-        return 2600
-    elif avg_cpl < 25:
-        return 2400
-    elif avg_cpl < 40:
-        return 2200
-    elif avg_cpl < 60:
-        return 2000
-    elif avg_cpl < 90:
-        return 1800
-    elif avg_cpl < 120:
-        return 1600
-    elif avg_cpl < 160:
-        return 1400
-    elif avg_cpl < 200:
-        return 1200
-    else:
-        return 1000
 
 
 def write_result_to_file(result: dict, idx: int, output_dir: Path):
@@ -313,7 +215,7 @@ async def get_model_move(api: InferenceAPI, fen: str, description: str, use_cot:
 
 async def run_experiment(test_mode: bool = False, concurrency: int = 100, num_positions: int = 500):
     """Run the experiment with concurrent API calls."""
-    utils.setup_environment()
+    st_utils.setup_environment()
 
     # Use OpenRouter API
     api = InferenceAPI(
